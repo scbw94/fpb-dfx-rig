@@ -419,19 +419,19 @@ D10, and exists to confirm the shipped code still passes.
 | T9 | PASS | 2 offset, 0 size | 2 offset, 0 size | **PASS** |
 
 Runs: [31778655841](https://github.com/scbw94/fpb-dfx-rig/actions/runs/31778655841),
-[31808328407](https://github.com/scbw94/fpb-dfx-rig/actions/runs/31808328407).
+[31808328407](https://github.com/scbw94/fpb-dfx-rig/actions/runs/31808328407), [31815903796](https://github.com/scbw94/fpb-dfx-rig/actions/runs/31815903796) (run 3, on the `--profile` commit — all green).
 
-**T3 failed its criterion on the first aarch64 run and passed on the second.**
-Run 1 produced `eagain 1` against a criterion of `eagain == 0`, alongside
-`odd_hits 8`; run 2 produced `eagain 0` and `samples 1250`. Both are recorded;
-the first is not withdrawn.
+**T3 failed its criterion on the first aarch64 run and has passed on both runs
+since.** Run 1 produced `eagain 1` against a criterion of `eagain == 0`, alongside
+`odd_hits 8`; runs 2 and 3 each produced `eagain 0` and `samples 1250`. All three
+are recorded; the first is not withdrawn.
 
 *Diagnosis.* `eagain` means one sample exhausted all 8 retries — the writer held
 the seqlock across eight consecutive read attempts — and was dropped. Two
 candidates were offered after run 1: a noisy neighbour on shared CI descheduling
-the producer mid-write, or a genuinely more active retry path on aarch64. **Run 2
-discriminates between them.** The same code on the same runner class produced
-zero, so the event is not reproducible and not a property of the architecture;
+the producer mid-write, or a genuinely more active retry path on aarch64. **Runs 2
+and 3 discriminate between them.** The same code on the same runner class produced
+zero twice, so the event is not reproducible and not a property of the architecture;
 the shared-runner explanation is the surviving one. The retry path *is* more
 active on aarch64 in general — T6 shows `odd_hits 11, torn 8` here against
 `odd_hits 8, torn 1` on x86-64 — but being more active is not the same as

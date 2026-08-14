@@ -10,3 +10,6 @@ fpb_dfxd
 # never commit the archive of ourselves
 fpb.zip
 *.zip
+
+# Windows download provenance streams
+*:Zone.Identifier
