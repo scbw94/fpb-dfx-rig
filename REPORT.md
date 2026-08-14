@@ -751,6 +751,35 @@ tested on half its input domain. And because §5.4 also clamps `cursor_us` to
 bar itself. Reported rather than altered; changing either would mean changing
 §5.4 or §5.5.
 
+**18. Every distribution in this rig is synthetic, and the prediction-mode
+parameters were chosen rather than fitted.** No capture data was supplied and
+neither binary reads any external file; §10 excludes replay from external JSON.
+The complete model is:
+
+| Quantity | Value | Provenance |
+|---|---|---|
+| Milestone fractions | the 12 values of §5.3 | **specified** |
+| `e_total_us` | `(1e6/fps) x load_pct/100` | **specified** |
+| Jitter distribution | symmetric uniform on ±`jitter_pct` | mechanism specified; **shape chosen** |
+| `jitter_pct` | 8 | **specified** (§5.1 default) |
+| RNG | xorshift32, seed `0x9E3779B9` | mechanism specified; **seed chosen** |
+| Difficulty AR(1) coefficients | 0.75 / 0.25 | **chosen** |
+| Difficulty clamp | [0.5, 1.8] | **chosen** |
+| `drift_pct` | 12 | **chosen** |
+| `ema_alpha` | 20 | **chosen** |
+
+The measured trace variance reported earlier (sd 975 µs against the nominal
+profile) was used to *diagnose* the sign problem of observation 17. It was **not**
+fed back in as a parameter; nothing here is fitted to any measurement.
+
+One consequence is worth stating plainly. A symmetric uniform is a poor model of
+frame time: real distributions are right-skewed with a heavy tail — shader
+compiles, memory stalls, thermal throttling — and this one has bounded support,
+no skew and no tail. So the rig cannot produce the frames a governor most needs
+to catch, and any figure derived from the shape of the distribution rather than
+from the transport should be treated as illustrative. The lead-time and syscall
+counts do not depend on the shape; the correlation of +0.276 in D10 does.
+
 ---
 
 ---
