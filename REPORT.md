@@ -517,6 +517,7 @@ This section is not empty.
 ### Gaps — underspecified, therefore not invented
 
 | D11 | **`README.md` and `trace_viewer.html` exist**, neither in §1's deliverable list. | Written so the rig can be handed to someone else and run without this conversation. The README is a quickstart plus the caveats from §9.5; the viewer renders captured `--out` JSONL and strace output. Neither changes the deliverables or the results. |
+| D12 | **`--profile NAME` replays a captured schedule and frame-time distribution**, and `tools/mkprofile.py` generates the embedded table. §10 defers replay from external data to a later phase. | The user supplied `captures/20260814/fpb_offline_model.json` — 6852 frames over five settings of one title — and asked for in-distribution generation per setting. The table is spliced into `fpb_producer.c` between sentinels rather than read at runtime, so the rig stays two dependency-free `.c` files, `cc -o fpb_producer fpb_producer.c` still builds with no flags and no `-lm`, and §10's exclusion of *runtime* JSON replay is not violated. Off by default: with no `--profile` the v1.1 path is byte-identical and every §9.3 result was re-confirmed on it. Limits in observation 19. |
 | # | Gap | What was done |
 |---|---|---|
 | G1 | **`header.heartbeat_ms` has no defined value.** §5.4 step 5 says "update `heartbeat_ms`" without stating whether it is milliseconds since start, monotonic ms, wall-clock ms, or a delta. No consumer check reads it. | Monotonic milliseconds since producer start, written with a relaxed accessor. Nothing depends on it, and no meaning is asserted. |
@@ -751,10 +752,12 @@ tested on half its input domain. And because §5.4 also clamps `cursor_us` to
 bar itself. Reported rather than altered; changing either would mean changing
 §5.4 or §5.5.
 
-**18. Every distribution in this rig is synthetic, and the prediction-mode
-parameters were chosen rather than fitted.** No capture data was supplied and
-neither binary reads any external file; §10 excludes replay from external JSON.
-The complete model is:
+**18. On the default path every distribution is synthetic, and the
+prediction-mode parameters were chosen rather than fitted.** This is the path
+every result in §9.3 was measured on, and it is unchanged. Capture data arrived
+afterwards and is available behind `--profile` (D12, observation 19); with no
+`--profile` the model is entirely as below. Neither binary ever reads an external
+file — §10's exclusion of runtime JSON replay still holds.
 
 | Quantity | Value | Provenance |
 |---|---|---|
@@ -770,15 +773,75 @@ The complete model is:
 
 The measured trace variance reported earlier (sd 975 µs against the nominal
 profile) was used to *diagnose* the sign problem of observation 17. It was **not**
-fed back in as a parameter; nothing here is fitted to any measurement.
+fed back in as a parameter; nothing on this path is fitted to any measurement.
 
 One consequence is worth stating plainly. A symmetric uniform is a poor model of
 frame time: real distributions are right-skewed with a heavy tail — shader
 compiles, memory stalls, thermal throttling — and this one has bounded support,
-no skew and no tail. So the rig cannot produce the frames a governor most needs
-to catch, and any figure derived from the shape of the distribution rather than
-from the transport should be treated as illustrative. The lead-time and syscall
-counts do not depend on the shape; the correlation of +0.276 in D10 does.
+no skew and no tail. So the default path cannot produce the frames a governor
+most needs to catch, and any figure derived from the shape of the distribution
+rather than from the transport should be treated as illustrative. The lead-time
+and syscall counts do not depend on the shape; the correlation of +0.276 in D10
+does. Observation 19 quantifies how much of this `--profile` repairs.
+
+---
+
+**19. The captured profiles fix the marginal and the schedule. They cannot fix
+any correlation, because the model has none to give.** `captures/20260814/
+fpb_offline_model.json` is 6852 frames across five settings of one title. It was
+checked programmatically for per-frame arrays: there are none. It is summary
+statistics, so what it can and cannot supply splits cleanly.
+
+| | Source |
+|---|---|
+| Milestone schedule (18–27 work items per setting, ACQUIRE where the capture puts it) | **captured** |
+| E_total quantiles at 0 / .10 / .25 / .50 / .75 / .90 and max | **captured** |
+| The p99 knot between p90 and max | **solved** so the sampled mean equals the captured mean |
+| Cross-milestone covariance within a frame | **absent — fixed at 1.0 by construction** |
+| Frame-to-frame autocorrelation | **absent — draws are IID** |
+
+The two absences have opposite signs and both matter.
+
+*Within a frame*, the shape is a fixed set of fractions scaled by that frame's
+E_total, so every milestone's error is a fixed multiple of the frame's error and
+the correlation between them is exactly 1. Real milestones are correlated but not
+perfectly. The rig therefore overstates how much an early anchor tells you about
+a late one.
+
+*Between frames*, draws are independent. Real frame times are strongly
+autocorrelated — a heavy scene stays heavy — and an EMA forecast exists precisely
+to exploit that. Forecasting IID draws is close to the worst case for an EMA, so
+**`snap_us` magnitudes under `--profile` are a pessimistic bound on forecast
+error, not an estimate of it.** A governor that copes with these numbers will cope
+with the real thing; one that fails here has not necessarily failed.
+
+What the captures do buy is the tail the default path could not produce
+(`--predict ema`, anchor mode, 7 s each):
+
+| profile | p10 µs | median µs | p90 µs | min µs | max µs | negative | IQR |
+|---|---|---|---|---|---|---|---|
+| synthetic (default) | −593 | +83 | +820 | −1 736 | +2 018 | 27.5 % | 0.46 ms |
+| game1 | −5 277 | +78 | +4 155 | −19 335 | +23 930 | 32.7 % | 2.14 ms |
+| game2 | −4 285 | +78 | +3 368 | −13 967 | +14 796 | 31.0 % | 1.78 ms |
+| game3 | −6 345 | +77 | +3 940 | −21 805 | +66 282 | 37.7 % | 2.30 ms |
+| game4 | −6 624 | +78 | +4 146 | −23 607 | +83 011 | 30.8 % | 2.21 ms |
+| game5 | −6 854 | +78 | +5 147 | −18 709 | +20 491 | 35.2 % | 2.68 ms |
+| combined | −6 230 | +78 | +4 900 | −25 718 | +96 575 | 34.7 % | 2.25 ms |
+
+The interquartile spread widens about fivefold and the extremes by fiftyfold —
+a 96 ms overrun against a 19.5 ms median frame is the kind of event the synthetic
+path structurally could not generate. The sampler was checked against its own
+source: replaying `game4` reproduces the captured marginal to within 1.5 ms at
+every decile from p10 to p90.
+
+One further note, because it is independent corroboration rather than my own
+measurement. The offline model carries its own replay diagnostics, and for two of
+the five settings it reports `acquire_snap … "degenerate": true` — snap pinned to
+a single constant (2199 µs and 2291 µs), which the accompanying report labels a
+"structural coverage gap before ACQUIRE". That is the same failure class as
+observation 17, found independently in different data by a different tool. It is
+evidence that a progress signal collapsing to a constant is a real hazard of this
+design and not an artifact of my replay.
 
 ---
 

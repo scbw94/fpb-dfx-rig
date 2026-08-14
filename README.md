@@ -44,6 +44,47 @@ Swap `--mode anchor` for `--mode poll --period-us 4000` and `writer_syscalls`
 should stay at **0** — a reader that never parks costs the writer nothing. That
 asymmetry is the main claim the rig exists to test.
 
+## Replaying a captured game setting
+
+The default profile is invented — a symmetric-uniform jitter around 12 hardcoded
+milestones. That has no skew and no tail, which is exactly the shape of frame a
+DVFS governor most needs to catch.
+
+`--profile` replaces it with a real one:
+
+```
+./fpb_producer --profile game4 --predict ema --fps 60 --frames 0 --quiet &
+./fpb_dfxd --mode anchor --secs 10 --verify --out run.jsonl
+kill %1
+```
+
+Six are embedded — `game1`…`game5` and `combined` — built from 6852 captured
+frames across five settings of one title. Each supplies its own work-item
+schedule (18–27 milestones, with ACQUIRE where the capture puts it) and its own
+frame-time distribution, redrawn every frame. The effect on the signal:
+
+| | IQR of `snap_us` | worst overrun |
+|---|---|---|
+| default (synthetic) | 0.46 ms | 2 ms |
+| `--profile combined` | 2.25 ms | 96 ms |
+
+To rebuild the table from a different capture:
+
+```
+python3 tools/mkprofile.py captures/<date>/fpb_offline_model.json
+```
+
+That rewrites a block inside `fpb_producer.c` between sentinel comments — the
+producer never opens the JSON, so the two-file no-dependency build is unaffected.
+
+**Two things it does not fix, both in `REPORT.md` observation 19.** The model is
+summary statistics, so it carries no correlations: within a frame the milestone
+shape is fixed and scaled, making cross-milestone correlation exactly 1; between
+frames the draws are independent, where real frame times are strongly
+autocorrelated. An EMA forecast exists to exploit autocorrelation, so it does
+worse here than it would on a real trace — read `snap_us` magnitudes under
+`--profile` as a **pessimistic bound** on forecast error, not an estimate of it.
+
 ## On a device (NDK + adb)
 
 ```
@@ -112,11 +153,13 @@ to answer "does it build and run at all", not to measure anything.
 | `DESIGN.md` | Architecture and the exchange catalogue E0–E9. Predates the `--predict` mode. |
 | `trace_viewer.html` | Open in a browser. Drag a `--out` JSONL onto it to see your own run. |
 | `Makefile` | Host, sanitizer and Android/NDK targets. The NDK ones are **unverified**. |
+| `tools/mkprofile.py` | Regenerates the embedded capture table from an offline model JSON. |
+| `captures/` | The offline models the profiles were built from. |
 | `.github/workflows/` | Runs the acceptance suite on a real aarch64 runner. |
 
 ## Read this before trusting a number
 
-`REPORT.md` §9.5 carries seventeen observations, and several are load-bearing:
+`REPORT.md` §9.5 carries nineteen observations, and several are load-bearing:
 
 - **Memory-ordering correctness is not established**, on either machine tested.
   A seqlock ordering bug is probabilistic; a passing five-second run is
@@ -124,6 +167,11 @@ to answer "does it build and run at all", not to measure anything.
 - **No latency figure transfers.** p50 wake latency measured 9 µs, 47 µs and
   87 µs on three different hosts with no change to the code.
 - **`snap_us` is non-negative by default**, so half the signal's range is
-  unreachable unless you pass `--predict ema`. See observation 17.
+  unreachable unless you pass `--predict ema`. See observation 17. The offline
+  model reaches the same conclusion independently on two of its five settings,
+  where it flags snap as degenerate — a constant.
+- **The captured profiles supply marginals, not correlations.** Frame draws are
+  IID where reality is autocorrelated, so `--profile` snap magnitudes bound
+  forecast error from above rather than estimating it. Observation 19.
 - **T8's stated pass criterion fails** — reported unadjusted, with the failure
   mode diagnosed.
