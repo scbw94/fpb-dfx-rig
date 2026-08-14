@@ -6,3 +6,7 @@ fpb_dfxd
 *.arm64
 *.aarch64
 *.jsonl
+
+# never commit the archive of ourselves
+fpb.zip
+*.zip
