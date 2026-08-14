@@ -44,45 +44,62 @@ Swap `--mode anchor` for `--mode poll --period-us 4000` and `writer_syscalls`
 should stay at **0** — a reader that never parks costs the writer nothing. That
 asymmetry is the main claim the rig exists to test.
 
-## On a phone (Termux)
-
-This is the interesting target: aarch64 is weakly ordered, and x86-64 cannot
-exercise the memory ordering this design depends on.
-
-Install Termux **from F-Droid** — the Play Store build is abandoned and broken on
-current Android.
+## On a device (NDK + adb)
 
 ```
-pkg install clang make binutils strace
-make host
-./fpb_producer --shm $HOME/fpb.shm --fps 60 --frames 0 --quiet &
-./fpb_dfxd --shm $HOME/fpb.shm --mode anchor --secs 5 --verify
-kill %1
+export ANDROID_NDK_HOME=/path/to/android-ndk-r26d
+make android          # cross-compiles for arm64-v8a
+make push             # adb push to /data/local/tmp
+make run-android      # 5 s anchor-mode pair, mirrors T4
 ```
+
+**These rules have never been executed** — no NDK, adb or device was available
+where this was built. They are written against the documented NDK r23+ layout
+with a preflight that fails loudly. Treat the first run as something to debug.
+
+Capture this first, because it decides whether the ordering question is even
+observable on that silicon:
+
+```
+adb shell uname -m
+adb shell grep -o 'lrcpc[0-9]*' /proc/cpuinfo | sort -u
+```
+
+No `lrcpc` means no `ldapr`, acquire compiles to `ldar`, and the §4.6
+acquire-vs-seq_cst distinction is invisible — the same blindness as `-march=armv8-a`.
 
 Three things that will bite:
 
-- **Keep the mapping on `$HOME`.** Termux's home is on the device's own
-  filesystem, which is what the shared futex needs — the key derives from
+- **Keep the mapping on `/data/local/tmp`.** That is the device's own filesystem,
+  which is what the shared futex needs — the key derives from
   `(inode, page offset)`. `/sdcard` is FUSE and will break the wake path in a way
-  that looks exactly like a lost-wakeup bug.
-- **`termux-wake-lock`**, and exempt Termux from battery optimisation, or Android
-  will suspend the backgrounded producer mid-run.
+  that looks exactly like a lost-wakeup bug, so you will go hunting for a memory
+  ordering problem that isn't there.
 - **`--fifo` will warn and continue.** `SCHED_FIFO` and `mlockall` are not
-  granted; this is expected and handled.
+  granted. Expected and handled.
+- **The code has only ever been compiled by GCC.** The NDK is clang against
+  bionic — untested. Clang surfaces warnings GCC does not, and with `-Werror`
+  that is a hard build failure. If `make android` fails, drop `-Werror` to see
+  the real message; it will be something small.
 
-**The code has only ever been compiled by GCC.** Clang against bionic is
-untested, and clang surfaces warnings GCC does not — with `-Werror` that is a
-hard failure. If `make host` fails, drop `-Werror` to see what it is actually
-complaining about; it will be something small.
+### What running on a device does and does not show
 
-Worth capturing first, since it decides whether the ordering question is even
-observable on that chip:
+It shows the code builds and runs against bionic on a mobile SoC, and that the
+shared futex works over a file mapping on an Android kernel. That last one is a
+genuine question a server-class aarch64 runner does not answer.
 
-```
-uname -m
-grep -o 'lrcpc[0-9]*' /proc/cpuinfo | sort -u
-```
+It does **not** put the rig anywhere near the environment the real design targets.
+This is a shell binary in `/data/local/tmp`, not a UMD process publishing to a
+system daemon: different SELinux context, different privileges, different
+scheduling, and a file-backed mapping rather than driver memory. In particular it
+says nothing about a shared futex over `VM_PFNMAP` — see `REPORT.md` §8, which
+expects that to fail outright. "It ran on a phone" is a weaker claim than it
+sounds; do not let it stand in for an on-device driver integration.
+
+Termux is a workable fallback if there is no NDK or no USB access, but it is
+worse for this: an app sandbox with cgroup throttling and background suspension,
+a different clang packaging, and timing noisier than CI already provides. Use it
+to answer "does it build and run at all", not to measure anything.
 
 ## What's here
 
