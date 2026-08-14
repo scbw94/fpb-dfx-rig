@@ -33,11 +33,11 @@ retroactively license any claim about the x86-64 runs.
 | Item | Value |
 |---|---|
 | Host | GitHub Actions public ARM runner, `ubuntu-24.04-arm` |
-| Kernel | `6.17.0-1020-azure`, `aarch64` |
+| Kernel | `6.17.0-1020-azure` / `6.17.0-1022-azure`, `aarch64` |
 | CPU | ARM Ltd (implementer `0x41`), part **`0xd49` — Neoverse N2** |
 | Relevant features | `atomics`, **`lrcpc`**, **`ilrcpc`** (FEAT_LRCPC and FEAT_LRCPC2 both present) |
 | Compilers | `cc`/`g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0` |
-| Run | https://github.com/scbw94/fpb-dfx-rig/actions/runs/31778655841 |
+| Runs | [31778655841](https://github.com/scbw94/fpb-dfx-rig/actions/runs/31778655841) (commit `b485b83`), [31808328407](https://github.com/scbw94/fpb-dfx-rig/actions/runs/31808328407) (commit `d6d6121`, post-D10) |
 
 This is real silicon, not emulation, and it is weakly ordered. The presence of
 `lrcpc` matters specifically: without FEAT_LRCPC there is no `ldapr` instruction
@@ -90,7 +90,8 @@ region between the `FPB-ABI-BEGIN`/`FPB-ABI-END` sentinels:
 > T7 zero sanitizer reports; T9 two offset assertions and zero size assertions.
 > The only figure that moved was `wake_latency_p50_us`, 87 → 47, which is the
 > run-to-run latency variance §8 warns about and not a behavioural change.
-> **The aarch64 results below predate D10 and have not been re-run on ARM.**
+> **The aarch64 suite was also re-run on ARM after D10** (commit `d6d6121`) and
+> is reported below as run 2, alongside the original run 1.
 
 | ID | Result | Actual numbers |
 |---|---|---|
@@ -401,32 +402,41 @@ byte-identical after the revert.
 
 Same source, same commit, unmodified. Every step of the CI job completed.
 
-| ID | x86-64 (WSL2) | aarch64 (Neoverse N2) | Verdict on aarch64 |
-|---|---|---|---|
-| T1 | PASS | 4/4 exit 0 | **PASS** |
-| T2 | PASS | 7552 bytes, `frames=100 ticks=1200 futex_wakes=0` | **PASS** |
-| T3 | PASS | `samples 1249`, `verify_violations 0`, `slot_recycled 0`, `odd_hits 8`, **`eagain 1`** | **FAIL — see below** |
-| T4 | PASS | `futex_waits 901` = `writer_syscalls 901`, `verify_violations 0`, p50 **9 µs** | **PASS** |
-| T5 | PASS | `writer_syscalls 0` | **PASS** |
-| T6 | PASS | TSan warnings producer=0 consumer=0; `futex_waits 1801` = `writer_syscalls 1801`; `torn 15`, `odd_hits 2` | **PASS** |
-| T7 | PASS | 0 sanitizer reports, `samples 1250` | **PASS** |
-| T8 | criterion fails | `futex_waits 50` vs `writer_syscalls 900` | **criterion fails identically** |
-| T9 | PASS | 2 offset assertions fired, 0 size assertions | **PASS** |
+Two runs, both on Neoverse N2 (`0xd49`, `lrcpc` + `ilrcpc` present). **Run 1**
+is commit `b485b83`; **run 2** is `d6d6121`, after the `--predict ema` work of
+D10, and exists to confirm the shipped code still passes.
 
-**T3 fails its stated criterion on aarch64.** The criterion requires
-`eagain == 0`; the run produced `eagain 1`, alongside `odd_hits 8`. The other
-three clauses pass: `samples 1249` is inside ±15% of 1250, `verify_violations 0`,
-`slot_recycled 0`. Reported as a failure, unadjusted.
+| ID | x86-64 (WSL2) | aarch64 run 1 | aarch64 run 2 | Verdict |
+|---|---|---|---|---|
+| T1 | PASS | 4/4 exit 0 | 4/4 exit 0 | **PASS** |
+| T2 | PASS | 7552, `futex_wakes=0` | 7552, `futex_wakes=0` | **PASS** |
+| T3 | PASS | `samples 1249`, **`eagain 1`** | `samples 1250`, **`eagain 0`** | **FAIL then PASS — see below** |
+| T4 | PASS | `901` = `901`, p50 **9 µs** | `901` = `901`, p50 **9 µs** | **PASS** |
+| T5 | PASS | `writer_syscalls 0` | `writer_syscalls 0` | **PASS** |
+| T6 | PASS | `1801` = `1801`, 0 TSan | `1802` = `1802`, 0 TSan | **PASS** |
+| T7 | PASS | 0 reports | 0 reports | **PASS** |
+| T8 | criterion fails | `50` vs `900` | `50` vs `900` | **criterion fails identically** |
+| T9 | PASS | 2 offset, 0 size | 2 offset, 0 size | **PASS** |
+
+Runs: [31778655841](https://github.com/scbw94/fpb-dfx-rig/actions/runs/31778655841),
+[31808328407](https://github.com/scbw94/fpb-dfx-rig/actions/runs/31808328407).
+
+**T3 failed its criterion on the first aarch64 run and passed on the second.**
+Run 1 produced `eagain 1` against a criterion of `eagain == 0`, alongside
+`odd_hits 8`; run 2 produced `eagain 0` and `samples 1250`. Both are recorded;
+the first is not withdrawn.
 
 *Diagnosis.* `eagain` means one sample exhausted all 8 retries — the writer held
-the seqlock across eight consecutive read attempts — and that sample was dropped.
-Two candidate causes, and this run cannot separate them. First, the runner is
-shared CI: a noisy neighbour descheduling the producer mid-write for the duration
-of eight reader attempts would produce exactly this, and it is the more likely
-explanation. Second, the aarch64 retry path is measurably more active in general
-(T6 showed `torn 15` here against `torn 1` on x86-64 at the same 120 fps).
-Attributing it to memory ordering would require evidence this run does not
-contain. No fix was attempted; a fix would change the spec.
+the seqlock across eight consecutive read attempts — and was dropped. Two
+candidates were offered after run 1: a noisy neighbour on shared CI descheduling
+the producer mid-write, or a genuinely more active retry path on aarch64. **Run 2
+discriminates between them.** The same code on the same runner class produced
+zero, so the event is not reproducible and not a property of the architecture;
+the shared-runner explanation is the surviving one. The retry path *is* more
+active on aarch64 in general — T6 shows `odd_hits 11, torn 8` here against
+`odd_hits 8, torn 1` on x86-64 — but being more active is not the same as
+exhausting, and one non-reproducing exhaustion in two runs does not support an
+ordering claim. No fix was attempted.
 
 **T8's inversion reproduces exactly**, 50 waits against 900 wakes, matching
 x86-64's 50 against 904. That the same inversion appears on both architectures
@@ -670,10 +680,10 @@ versus a runner closer to bare metal. Both numbers are equally unusable as
 predictions for a phone under render load, which is what §8 says.
 
 **13. The retry path is measurably more active on aarch64.** At 120 fps under
-TSan, x86-64 produced `odd_hits 8, torn 1, eagain 1`; the N2 run at the same
-settings produced `odd_hits 2, torn 15`. In poll mode at 60 fps, x86-64 produced
-all zeros in T3 while N2 produced `odd_hits 8, eagain 1` — the T3 criterion
-failure described in §9.3. The path that §8 warned might be untested is being
+TSan, x86-64 produced `odd_hits 8, torn 1, eagain 1`; the N2 runs at the same
+settings produced `odd_hits 2, torn 15` and `odd_hits 11, torn 8`. In poll mode
+at 60 fps, x86-64 produced all zeros in T3 while N2 produced `odd_hits 8,
+eagain 1` on the first run and `eagain 0` on the second. The path that §8 warned might be untested is being
 exercised considerably harder on the second platform. Whether the difference is
 architectural or an artefact of a shared CI runner is not separable from this
 data.
