@@ -221,6 +221,30 @@ static void fpb_on_signal(int sig)
     fpb_stop = 1;
 }
 
+/*
+ * Prediction mode (--predict ema). NOT part of spec v1.1; see REPORT.md §9.4.
+ *
+ * In v1.1 the producer generates a jittered schedule, stamps it, and then sleeps
+ * to its own offsets. "Scheduled" and "actual" are therefore the same object and
+ * snap_us can only ever capture sleep overshoot — it is non-negative by
+ * construction and half the signal's range is unreachable (§9.5 observation 17).
+ *
+ * In prediction mode the two are separated, which is what a real UMD does:
+ *
+ *   stamped notch_us[]  = an EMA over previous frames' ACTUAL offsets — a
+ *                         forecast, which reality is free to beat or miss
+ *   actual firing times = nominal profile x a per-frame difficulty x per-
+ *                         milestone jitter
+ *   snap_us             = actual - forecast, and so signed in both directions
+ *
+ * The per-frame difficulty is a common mode: it scales the whole frame, which is
+ * what makes an early anchor informative about a later one. Without it every
+ * milestone is independent and early deviation forecasts nothing (§9.5
+ * observation 16). It is AR(1) so that difficulty also drifts across frames and
+ * the EMA visibly lags, which is the interesting failure mode for a predictor.
+ */
+static double fpb_difficulty = 1.0;
+
 /* §5.3: deterministic xorshift32, fixed seed, so runs reproduce exactly. */
 static uint32_t fpb_rng = 0x9E3779B9u;
 
@@ -307,6 +331,42 @@ static void fpb_build_schedule(uint32_t e_total_us, uint32_t jitter_pct,
     }
 }
 
+/* Symmetric uniform in [-1, +1] from the same deterministic stream. */
+static double fpb_unit(void)
+{
+    return ((double)(fpb_xorshift32() % 2001u) - 1000.0) / 1000.0;
+}
+
+/*
+ * The ACTUAL milestone offsets for one frame, in prediction mode. Nominal
+ * profile scaled by an AR(1) per-frame difficulty (common mode), then per
+ * milestone jitter (independent mode). Strict monotonicity enforced as §5.3
+ * requires; index 0 is pinned to 0 but index 11 is NOT pinned, because the
+ * whole point is that the actual frame total varies.
+ */
+static void fpb_build_actual(uint32_t e_nom_us, uint32_t jitter_pct,
+                             uint32_t drift_pct, uint32_t *act_us)
+{
+    uint32_t i;
+
+    fpb_difficulty = 0.75 * fpb_difficulty
+                   + 0.25 * (1.0 + fpb_unit() * (double)drift_pct / 100.0);
+    if (fpb_difficulty < 0.5) fpb_difficulty = 0.5;
+    if (fpb_difficulty > 1.8) fpb_difficulty = 1.8;
+
+    for (i = 0; i < FPB_PROFILE_LEN; i++) {
+        double base = fpb_profile[i].frac * (double)e_nom_us * fpb_difficulty;
+        double v = base * (1.0 + fpb_unit() * (double)jitter_pct / 100.0);
+        act_us[i] = (v < 0.0) ? 0u : (uint32_t)v;
+    }
+    act_us[0] = 0u;
+    for (i = 1u; i < FPB_PROFILE_LEN; i++)
+        if (act_us[i] <= act_us[i - 1u])
+            act_us[i] = act_us[i - 1u] + 1u;
+    for (i = FPB_PROFILE_LEN; i < FPB_NOTCH_MAX; i++)
+        act_us[i] = 0u;
+}
+
 /* §5.1 --fifo: warn and continue on failure; never exit. */
 static void fpb_try_fifo(void)
 {
@@ -333,7 +393,12 @@ static void fpb_usage(void)
         "  --load-pct N      %% of frame budget the schedule spans (default 85)\n"
         "  --jitter-pct N    per-milestone jitter, integer percent (default 8)\n"
         "  --fifo            attempt SCHED_FIFO 40 and mlockall\n"
-        "  --quiet           suppress per-frame progress on stderr\n");
+        "  --quiet           suppress per-frame progress on stderr\n"
+        "\n"
+        "  --predict ema     stamp an EMA forecast instead of the actual schedule,\n"
+        "                    so snap_us becomes a signed forecast error (non-spec)\n"
+        "  --ema-alpha N     EMA weight percent, default 20 (with --predict)\n"
+        "  --drift-pct N     per-frame common-mode difficulty percent, default 12\n");
 }
 
 int main(int argc, char **argv)
@@ -342,6 +407,9 @@ int main(int argc, char **argv)
     uint32_t fps = 60u, load_pct = 85u, jitter_pct = 8u;
     uint64_t frames = 600u;
     int use_fifo = 0, quiet = 0;
+    int predict = 0;
+    uint32_t ema_alpha = 20u, drift_pct = 12u;
+    uint32_t pred_us[FPB_NOTCH_MAX];
     int i;
 
     int fd;
@@ -360,6 +428,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--jitter-pct") && i + 1 < argc) jitter_pct = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--fifo"))                       use_fifo = 1;
         else if (!strcmp(argv[i], "--quiet"))                      quiet = 1;
+        else if (!strcmp(argv[i], "--ema-alpha") && i + 1 < argc)   ema_alpha = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--drift-pct") && i + 1 < argc)   drift_pct = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--predict") && i + 1 < argc) {
+            if (!strcmp(argv[++i], "ema")) predict = 1;
+            else { fpb_usage(); return 2; }
+        }
         else { fpb_usage(); return 2; }
     }
 
@@ -426,6 +500,12 @@ int main(int argc, char **argv)
     FPB_FENCE_REL();
     h->magic = FPB_MAGIC;   /* plain per §3.6; ordered by the fence above */
 
+    /* Seed the forecast with the nominal §5.3 profile: frame 0 has no history. */
+    for (i = 0; i < (int)FPB_NOTCH_MAX; i++)
+        pred_us[i] = (i < (int)FPB_PROFILE_LEN)
+                   ? (uint32_t)(fpb_profile[i].frac * (double)e_total_us) : 0u;
+    pred_us[FPB_PROFILE_LEN - 1u] = e_total_us;
+
     period_ns    = 1000000000ull / (uint64_t)fps;
     t_start_ns   = fpb_now_ns();
     next_open_ns = t_start_ns;
@@ -439,10 +519,27 @@ int main(int argc, char **argv)
         struct fpb_slot *s = &slots[frame & (FPB_SLOTS - 1u)];
         struct fpb_payload *p = &s->p;
         uint32_t notch_us[FPB_NOTCH_MAX], notch_kind[FPB_NOTCH_MAX];
+        uint32_t act_us[FPB_NOTCH_MAX];
+        uint32_t e_stamp;
         uint64_t t_open_ns, now_ns;
         uint32_t m;
 
-        fpb_build_schedule(e_total_us, jitter_pct, notch_us, notch_kind);
+        if (predict) {
+            /* Actual is drawn fresh; stamped is the standing forecast. The two
+             * are independent, so snap_us = actual - forecast is signed. */
+            fpb_build_actual(e_total_us, jitter_pct, drift_pct, act_us);
+            for (m = 0u; m < FPB_NOTCH_MAX; m++) {
+                notch_us[m]   = pred_us[m];
+                notch_kind[m] = (m < FPB_PROFILE_LEN) ? fpb_profile[m].kind : FPB_KIND_DELTA;
+            }
+            e_stamp = pred_us[FPB_PROFILE_LEN - 1u];
+        } else {
+            /* v1.1: the stamped schedule IS the schedule that gets slept to. */
+            fpb_build_schedule(e_total_us, jitter_pct, notch_us, notch_kind);
+            for (m = 0u; m < FPB_NOTCH_MAX; m++)
+                act_us[m] = notch_us[m];
+            e_stamp = e_total_us;
+        }
 
         fpb_sleep_until_ns(next_open_ns);
         if (fpb_stop)
@@ -452,7 +549,7 @@ int main(int argc, char **argv)
         /* §5.4 step 2: stamp the schedule under the seqlock. */
         fpb_write_begin(s);
         p->frame_id    = (uint32_t)frame;
-        p->e_total_us  = e_total_us;
+        p->e_total_us  = e_stamp;
         p->notch_count = FPB_PROFILE_LEN;
         p->cursor_us   = 0u;
         p->snap_us     = 0;
@@ -476,13 +573,14 @@ int main(int argc, char **argv)
         for (m = 0u; m < FPB_PROFILE_LEN && !fpb_stop; m++) {
             uint64_t elapsed_us;
 
-            fpb_sleep_until_ns(t_open_ns + (uint64_t)notch_us[m] * 1000ull);
+            /* Sleep to when the work ACTUALLY completes, not to the forecast. */
+            fpb_sleep_until_ns(t_open_ns + (uint64_t)act_us[m] * 1000ull);
             now_ns     = fpb_now_ns();
             elapsed_us = (now_ns - t_open_ns) / 1000ull;
 
             fpb_write_begin(s);
-            p->cursor_us = (elapsed_us > (uint64_t)e_total_us)
-                         ? e_total_us : (uint32_t)elapsed_us;
+            p->cursor_us = (elapsed_us > (uint64_t)e_stamp)
+                         ? e_stamp : (uint32_t)elapsed_us;
             p->t_tick_lo = (uint32_t)(now_ns & 0xFFFFFFFFu);
             p->t_tick_hi = (uint32_t)(now_ns >> 32);
             if (m < 32u)
@@ -509,6 +607,18 @@ int main(int argc, char **argv)
                     FPB_ADD_RLX(h->writer_syscalls, 1u);
                 }
             }
+        }
+
+        /* Fold this frame's actuals into the forecast for the next one. The
+         * predictor therefore lags any sustained drift, which is exactly the
+         * behaviour a governor has to cope with. */
+        if (predict) {
+            for (m = 0u; m < FPB_PROFILE_LEN; m++)
+                pred_us[m] = (uint32_t)(((uint64_t)act_us[m] * ema_alpha
+                                       + (uint64_t)pred_us[m] * (100u - ema_alpha)) / 100u);
+            for (m = 1u; m < FPB_PROFILE_LEN; m++)
+                if (pred_us[m] <= pred_us[m - 1u])
+                    pred_us[m] = pred_us[m - 1u] + 1u;
         }
 
         /* §5.4 step 5. */

@@ -82,6 +82,16 @@ region between the `FPB-ABI-BEGIN`/`FPB-ABI-END` sentinels:
 
 ## 9.3 Test results
 
+> **Re-validated after D10.** The `--predict ema` mode added 116 lines to
+> `fpb_producer.c` after these results were first taken, so the whole suite was
+> re-run against the modified binary. Every count reproduced exactly —
+> T3 `samples 1250`; T4 `futex_waits 901` = `writer_syscalls 901`;
+> T5 `writer_syscalls 0`; T6 `1801` = `1801` with zero TSan warnings;
+> T7 zero sanitizer reports; T9 two offset assertions and zero size assertions.
+> The only figure that moved was `wake_latency_p50_us`, 87 → 47, which is the
+> run-to-run latency variance §8 warns about and not a behavioural change.
+> **The aarch64 results below predate D10 and have not been re-run on ARM.**
+
 | ID | Result | Actual numbers |
 |---|---|---|
 | **T1** | **PASS** | 4/4 commands exit 0. Only the `_GNU_SOURCE` warning (158 and 155 bytes of output on commands 3 and 4; 0 bytes on 1 and 2). |
@@ -492,9 +502,11 @@ This section is not empty.
 | D7 | **Sanitizer builds use suffixed binary names** (`fpb_producer_tsan` etc.) rather than overwriting `fpb_producer`. | Keeps the §2.2 artifacts intact while T6/T7 run. Same source, same flags otherwise. |
 | D8 | **`FPB_MAP_BYTES` macro added** to the ABI block. | §3.5 requires asserting the total mapping size and the value is needed at three sites (`ftruncate`, the `fstat` check, the assertion). It names a spec-mandated quantity rather than introducing a new one. |
 | D9 | **A CI workflow exists** (`.github/workflows/aarch64.yml`), and the deliverables were published to a public GitHub repository. | Direct user instruction. Same standing as D1: §1/§10 exclude build tooling, and the user overrode that. The workflow runs the §7 tests unmodified on real aarch64 and adds no capability to the deliverables themselves. It is what produced the second environment in §9.1. |
+| D10 | **The producer has an opt-in `--predict ema` mode**, with `--ema-alpha` and `--drift-pct`. This changes §5.3 and §5.4's contract and adds three flags to §5.1. | Direct user instruction, following §9.5 observation 17. In v1.1 the producer stamps its own jittered schedule and then sleeps to it, so `snap_us` is non-negative by construction and half the signal is unreachable. In this mode the stamped `notch_us[]` is an EMA over previous frames' *actual* offsets — a forecast — while the actual firing times are drawn from the nominal profile scaled by an AR(1) per-frame difficulty and per-milestone jitter. `snap_us` is then a signed forecast error. **The flag is off by default and the v1.1 path is byte-for-byte the same code path**, so every T1–T9 result in §9.3 stands unchanged; this was verified by re-running the default and confirming `snap_us` still has zero negatives and `verify_violations 0`. |
 
 ### Gaps — underspecified, therefore not invented
 
+| D11 | **`README.md` and `trace_viewer.html` exist**, neither in §1's deliverable list. | Written so the rig can be handed to someone else and run without this conversation. The README is a quickstart plus the caveats from §9.5; the viewer renders captured `--out` JSONL and strace output. Neither changes the deliverables or the results. |
 | # | Gap | What was done |
 |---|---|---|
 | G1 | **`header.heartbeat_ms` has no defined value.** §5.4 step 5 says "update `heartbeat_ms`" without stating whether it is milliseconds since start, monotonic ms, wall-clock ms, or a delta. No consumer check reads it. | Monotonic milliseconds since producer start, written with a relaxed accessor. Nothing depends on it, and no meaning is asserted. |
@@ -670,6 +682,64 @@ data.
 at 60 fps, 1801 and 1801 at 120 fps under TSan — the same exact equality observed
 on x86-64 at three frame rates, now on a fourth and fifth data point on different
 silicon. The ±2% band has yet to be approached on any platform tested.
+
+**15. `snap_us` carries a systematic positive offset that is not schedule
+deviation.** Across 37 fully-observed frames at 20 fps, the median `snap_us` was
+**+111 µs at FRAME_OPEN, +122 µs at ACQUIRE and +131 µs at FRAME_END**, with a
+p10–p90 spread of roughly ±40 µs about those medians. The sign is consistently
+positive at every anchor including FRAME_OPEN, where the scheduled offset is 0
+by definition and no schedule deviation is possible. The offset is therefore the
+cost of the publish path itself — `clock_nanosleep` wake latency plus the seqlock
+write — and not the quantity §5.4 describes the field as measuring. Under strace
+the same figure rose to +303 µs, consistent with ptrace overhead landing in the
+same path. A consumer reading this field would be reading a baseline plus a
+deviation, not a deviation.
+
+**16. Early `snap_us` does not forecast late `snap_us` in this replay, by
+construction.** Correlation between the FRAME_OPEN value and the FRAME_END value
+of the same frame was **−0.055**; between ACQUIRE and FRAME_END, **+0.035**. Both
+are indistinguishable from zero. This follows directly from §5.3: the xorshift
+jitter is drawn independently per milestone, so there is no mechanism by which an
+early deviation could carry information about a later one. It is a property of
+the synthetic profile, not a measurement of the design. The rig can therefore
+demonstrate the *timeliness* of the signal — at ACQUIRE it is published with
+15 150 µs of the 50 000 µs frame period still remaining at 20 fps — but it cannot
+demonstrate that the signal's *value* is predictive of anything. That question
+belongs to a real workload, where a slow draw plausibly does make the rest of the
+frame slow.
+
+
+**17. `snap_us` can never be negative in this replay, so half the signal's range
+is unreachable.** Across 10 289 samples in four runs the minimum observed value
+was **0** and no sample in any run was negative. This is structural, not
+incidental. §5.5 paces with `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`,
+which by contract sleeps until *at least* the deadline and cannot return early;
+§5.4 then computes `snap_us = elapsed_us - offset_us` from a timestamp taken
+after that sleep. Therefore `elapsed_us >= offset_us` always, and `snap_us >= 0`
+always.
+
+The deeper cause is that the replay's schedule is **self-fulfilling**. §5.4 has
+the producer generate the jittered `notch_us[]` at frame open and then sleep to
+its own offsets, so "scheduled" and "actual" are the same object and their
+difference can only be sleep overshoot. A writer whose milestones fire when work
+*completes* is measuring actual against a *prediction*, and real work can beat a
+prediction — that is the case the signed field exists for, and the case this rig
+structurally cannot produce.
+
+**The plumbing for the negative case is correct but untested by the test suite.**
+Verified directly: with the producer stopped, a negative value was written into
+`payload.snap_us` of the live slot under the seqlock, and the consumer logged
+`"snap_us":-4321` on all 500 subsequent samples. The sign survives
+`fpb_copy_payload`'s word-wise `uint32_t` loads and reads back correctly as
+`int32_t`. So the ABI, the copy and the JSONL path all handle the slack case; only
+the producer cannot generate it.
+
+Two consequences worth stating. A consumer exercised solely against this rig is
+tested on half its input domain. And because §5.4 also clamps `cursor_us` to
+`e_total_us`, an overrunning frame pins the progress bar at maximum, so the
+*magnitude* of lateness is available only from `snap_us` at anchors, not from the
+bar itself. Reported rather than altered; changing either would mean changing
+§5.4 or §5.5.
 
 ---
 
