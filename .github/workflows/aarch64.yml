@@ -1,0 +1,167 @@
+# FPB DFX rig — acceptance tests on real aarch64 hardware.
+#
+# DEVIATION FROM SPEC. FPB_DFX_RIG_SPEC.md v1.1 §1 says "no build system" and
+# §10 excludes one. This file, like the Makefile, exists at the user's direct
+# instruction and is recorded in REPORT.md §9.4.
+#
+# Purpose: §8 states that memory-ordering correctness cannot be established on
+# x86-64, because the barriers compile to nothing and a missing one passes
+# silently. GitHub's public ARM runners are real Ampere/Graviton silicon, not
+# emulation, so this is the cheapest way to run T1-T9 on a machine that
+# genuinely reorders.
+#
+# Runner note: `ubuntu-24.04-arm` is free for PUBLIC repositories. On a private
+# repo it is billable. If the label is unavailable, try `ubuntu-22.04-arm`.
+
+name: aarch64 acceptance
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Does this machine even have the feature that makes the experiment
+      # interesting? Without FEAT_LRCPC there is no `ldapr`, acquire compiles
+      # to `ldar`, and the v1.0/v1.1 distinction stays invisible exactly as it
+      # does at -march=armv8-a.
+      # ------------------------------------------------------------------
+      - name: Environment
+        run: |
+          echo "== arch =="; uname -srm
+          echo "== cpu =="; grep -m1 'CPU implementer' /proc/cpuinfo || true
+          grep -m1 'CPU part' /proc/cpuinfo || true
+          echo "== features =="; grep -m1 '^Features' /proc/cpuinfo | tr ' ' '\n' | grep -E 'lrcpc|atomics|lse' | sort -u || echo "(none matched)"
+          echo "== FEAT_LRCPC present? =="
+          if grep -qw lrcpc /proc/cpuinfo; then echo "YES - ldapr exists, the acquire/seq_cst distinction is observable"; \
+          else echo "NO - acquire will compile to ldar; distinction NOT observable here"; fi
+          echo "== toolchain =="; cc --version | head -1; g++ --version | head -1
+
+      - name: T1 - build and dialect check
+        run: |
+          cc  -O2 -std=c11 -Wall -Wextra -Werror -o fpb_producer fpb_producer.c
+          cc  -O2 -std=c11 -Wall -Wextra -Werror -o fpb_dfxd    fpb_dfxd.c
+          g++ -std=c++17 -fsyntax-only -x c++ fpb_producer.c
+          g++ -std=c++17 -fsyntax-only -x c++ fpb_dfxd.c
+          echo "T1: all four exit 0"
+
+      - name: T2 - producer alone, no consumer
+        run: |
+          rm -f /tmp/fpb.shm
+          ./fpb_producer --frames 100 --quiet
+          SZ=$(stat -c %s /tmp/fpb.shm)
+          echo "file size: $SZ (must be 7552)"
+          test "$SZ" = "7552"
+
+      - name: T3 - poll mode, 5s, verify
+        run: |
+          rm -f /tmp/fpb.shm
+          ./fpb_producer --fps 60 --frames 0 --quiet >/dev/null 2>&1 &
+          PP=$!; sleep 0.5
+          ./fpb_dfxd --mode poll --period-us 4000 --secs 5 --verify
+          kill -TERM $PP 2>/dev/null || true; wait $PP 2>/dev/null || true
+
+      - name: T4 - anchor mode, 5s, verify
+        run: |
+          rm -f /tmp/fpb.shm
+          ./fpb_producer --fps 60 --frames 0 --quiet >/dev/null 2>&1 &
+          PP=$!; sleep 0.5
+          ./fpb_dfxd --mode anchor --secs 5 --verify
+          kill -TERM $PP 2>/dev/null || true; wait $PP 2>/dev/null || true
+
+      - name: T5 - gated path, writer_syscalls must stay 0
+        run: |
+          rm -f /tmp/fpb.shm
+          ./fpb_producer --fps 60 --frames 0 --quiet >/dev/null 2>&1 &
+          PP=$!; sleep 0.5
+          ./fpb_dfxd --mode poll --period-us 4000 --secs 5 --verify 2>&1 | tee t5.txt
+          kill -TERM $PP 2>/dev/null || true; wait $PP 2>/dev/null || true
+          grep -q '^writer_syscalls 0$' t5.txt && echo "T5: writer_syscalls == 0"
+
+      # GCC's -Wtsan rejects __atomic_thread_fence under -fsanitize=thread and
+      # the fences are mandated by §3.4, so -Werror is dropped here only. See
+      # REPORT.md §9.4 D4. setarch -R may also be needed (D5).
+      - name: T6 - ThreadSanitizer at 120 fps
+        continue-on-error: true
+        run: |
+          cc -fsanitize=thread -O2 -std=c11 -Wall -Wextra -o p_tsan fpb_producer.c
+          cc -fsanitize=thread -O2 -std=c11 -Wall -Wextra -o c_tsan fpb_dfxd.c
+          rm -f /tmp/fpb.shm
+          setarch -R ./p_tsan --fps 120 --frames 0 --quiet > p_tsan.log 2>&1 &
+          PP=$!; sleep 1
+          setarch -R ./c_tsan --mode anchor --secs 5 --verify 2>&1 | tee c_tsan.log
+          kill -TERM $PP 2>/dev/null || true; wait $PP 2>/dev/null || true
+          echo "TSan warnings: producer=$(grep -c 'WARNING: ThreadSanitizer' p_tsan.log) consumer=$(grep -c 'WARNING: ThreadSanitizer' c_tsan.log)"
+
+      - name: T7 - ASan + UBSan
+        continue-on-error: true
+        run: |
+          cc -fsanitize=address,undefined -O2 -std=c11 -Wall -Wextra -Werror -o p_asan fpb_producer.c
+          cc -fsanitize=address,undefined -O2 -std=c11 -Wall -Wextra -Werror -o c_asan fpb_dfxd.c
+          rm -f /tmp/fpb.shm
+          setarch -R ./p_asan --fps 60 --frames 0 --quiet > p_asan.log 2>&1 &
+          PP=$!; sleep 1
+          setarch -R ./c_asan --mode poll --period-us 4000 --secs 5 --verify 2>&1 | tee c_asan.log
+          kill -TERM $PP 2>/dev/null || true; wait $PP 2>/dev/null || true
+          echo "sanitizer reports: $(cat p_asan.log c_asan.log | grep -cE 'ERROR: (Address|Leak)Sanitizer|runtime error')"
+
+      - name: T8 - negative control, FUTEX_PRIVATE_FLAG on the wait opcode
+        run: |
+          sed 's/^#define FPB_FUTEX_WAIT 0$/#define FPB_FUTEX_WAIT (0 | 128)/' fpb_dfxd.c > dfxd_private.c
+          cc -O2 -std=c11 -Wall -Wextra -Werror -o dfxd_private dfxd_private.c
+          rm -f /tmp/fpb.shm
+          ./fpb_producer --fps 60 --frames 0 --quiet >/dev/null 2>&1 &
+          PP=$!; sleep 0.5
+          ./dfxd_private --mode anchor --secs 5 --verify
+          kill -TERM $PP 2>/dev/null || true; wait $PP 2>/dev/null || true
+          rm -f dfxd_private dfxd_private.c
+
+      - name: T9 - negative control, offset assertions must catch a field swap
+        run: |
+          python3 - <<'EOF'
+          p='fpb_dfxd.c'; s=open(p).read()
+          a="    uint32_t cursor_us;       /* clamped to e_total_us writer-side */\n    int32_t  snap_us;         /* signed; last anchor reconciliation */\n"
+          b="    int32_t  snap_us;         /* signed; last anchor reconciliation */\n    uint32_t cursor_us;       /* clamped to e_total_us writer-side */\n"
+          assert a in s, "anchor text not found"
+          open('dfxd_swapped.c','w').write(s.replace(a,b,1))
+          EOF
+          if cc -O2 -std=c11 -Wall -Wextra -Werror -o /dev/null dfxd_swapped.c 2> t9.txt; then
+            echo "T9 FAIL: the swapped build compiled, offset assertions did not fire"; exit 1
+          fi
+          grep 'static assertion failed' t9.txt
+          echo "size assertions fired: $(grep -cE 'static assertion failed.*(one page|payload size|slot size|total mapping)' t9.txt) (must be 0)"
+          rm -f dfxd_swapped.c
+
+      # ------------------------------------------------------------------
+      # The reason this job exists. On x86-64 these all emit nothing.
+      # ------------------------------------------------------------------
+      - name: Barrier codegen, native target
+        run: |
+          cc -O2 -std=c11 -mcpu=native -c -o prod_native.o fpb_producer.c
+          cc -O2 -std=c11 -mcpu=native -c -o cons_native.o fpb_dfxd.c
+          for o in prod_native.o cons_native.o; do
+            echo "== $o =="
+            objdump -d $o --no-show-raw-insn \
+              | grep -oE '\b(dmb[[:space:]]+[a-z]+|stlr|ldar|ldapr|ldaxr|stlxr|ldaddal|ldadd|yield)\b' \
+              | sed 's/  */ /' | sort | uniq -c | sort -rn
+          done
+
+      - name: v1.0 vs v1.1 ordering, at the re-check site
+        run: |
+          sed 's/if (FPB_LOAD_SEQ(h->futex_word) == seen)/if (FPB_LOAD_ACQ(h->futex_word) == seen)/' fpb_dfxd.c > v10.c
+          cc -O2 -std=c11 -mcpu=native -c -o v11.o fpb_dfxd.c
+          cc -O2 -std=c11 -mcpu=native -c -o v10.o v10.c
+          for v in v11 v10; do
+            printf "%s: ldar=%s ldapr=%s\n" "$v" \
+              "$(objdump -d $v.o --no-show-raw-insn | grep -cw ldar)" \
+              "$(objdump -d $v.o --no-show-raw-insn | grep -cw ldapr)"
+          done
+          echo "Expected on a FEAT_LRCPC machine: v11 keeps an ldar at the re-check, v10 does not."
+          rm -f v10.c
