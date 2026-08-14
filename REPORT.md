@@ -23,6 +23,26 @@ Against `FPB_DFX_RIG_SPEC.md` **v1.1**.
 The §2.1 requirement is satisfied: this is WSL2, not WSL1, and the shared file is
 on the ext4 root filesystem, not on a DrvFs (`/mnt/*`) path.
 
+### Second environment — aarch64
+
+After the x86-64 work was complete, the user requested an Android/aarch64 build
+path. That produced a second execution environment, and T1–T9 were re-run on it.
+All results from it are labelled as such and kept separate; they do not
+retroactively license any claim about the x86-64 runs.
+
+| Item | Value |
+|---|---|
+| Host | GitHub Actions public ARM runner, `ubuntu-24.04-arm` |
+| Kernel | `6.17.0-1020-azure`, `aarch64` |
+| CPU | ARM Ltd (implementer `0x41`), part **`0xd49` — Neoverse N2** |
+| Relevant features | `atomics`, **`lrcpc`**, **`ilrcpc`** (FEAT_LRCPC and FEAT_LRCPC2 both present) |
+| Compilers | `cc`/`g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0` |
+| Run | https://github.com/scbw94/fpb-dfx-rig/actions/runs/31778655841 |
+
+This is real silicon, not emulation, and it is weakly ordered. The presence of
+`lrcpc` matters specifically: without FEAT_LRCPC there is no `ldapr` instruction
+and the acquire/seq_cst distinction of §4.6 is not observable at all.
+
 ---
 
 ## 9.2 Build
@@ -367,6 +387,73 @@ reader would have misinterpreted two fields indefinitely. Only the offset
 assertions caught it. Reverted afterwards; the ABI blocks were re-verified
 byte-identical after the revert.
 
+### T1–T9 re-run on aarch64 (Neoverse N2)
+
+Same source, same commit, unmodified. Every step of the CI job completed.
+
+| ID | x86-64 (WSL2) | aarch64 (Neoverse N2) | Verdict on aarch64 |
+|---|---|---|---|
+| T1 | PASS | 4/4 exit 0 | **PASS** |
+| T2 | PASS | 7552 bytes, `frames=100 ticks=1200 futex_wakes=0` | **PASS** |
+| T3 | PASS | `samples 1249`, `verify_violations 0`, `slot_recycled 0`, `odd_hits 8`, **`eagain 1`** | **FAIL — see below** |
+| T4 | PASS | `futex_waits 901` = `writer_syscalls 901`, `verify_violations 0`, p50 **9 µs** | **PASS** |
+| T5 | PASS | `writer_syscalls 0` | **PASS** |
+| T6 | PASS | TSan warnings producer=0 consumer=0; `futex_waits 1801` = `writer_syscalls 1801`; `torn 15`, `odd_hits 2` | **PASS** |
+| T7 | PASS | 0 sanitizer reports, `samples 1250` | **PASS** |
+| T8 | criterion fails | `futex_waits 50` vs `writer_syscalls 900` | **criterion fails identically** |
+| T9 | PASS | 2 offset assertions fired, 0 size assertions | **PASS** |
+
+**T3 fails its stated criterion on aarch64.** The criterion requires
+`eagain == 0`; the run produced `eagain 1`, alongside `odd_hits 8`. The other
+three clauses pass: `samples 1249` is inside ±15% of 1250, `verify_violations 0`,
+`slot_recycled 0`. Reported as a failure, unadjusted.
+
+*Diagnosis.* `eagain` means one sample exhausted all 8 retries — the writer held
+the seqlock across eight consecutive read attempts — and that sample was dropped.
+Two candidate causes, and this run cannot separate them. First, the runner is
+shared CI: a noisy neighbour descheduling the producer mid-write for the duration
+of eight reader attempts would produce exactly this, and it is the more likely
+explanation. Second, the aarch64 retry path is measurably more active in general
+(T6 showed `torn 15` here against `torn 1` on x86-64 at the same 120 fps).
+Attributing it to memory ordering would require evidence this run does not
+contain. No fix was attempted; a fix would change the spec.
+
+**T8's inversion reproduces exactly**, 50 waits against 900 wakes, matching
+x86-64's 50 against 904. That the same inversion appears on both architectures
+supports the §9.3 diagnosis that the criterion mis-describes the failure mode of
+a private futex, rather than the behaviour being platform-specific.
+
+### aarch64 barrier codegen at `-mcpu=native`
+
+Compiled on the N2 runner itself, so the target is exactly the silicon executing
+it:
+
+```
+== prod_native.o ==            == cons_native.o ==
+      3 stlr                         3 ldapr
+      3 dmb   ish                    2 ldaddal
+      1 ldar                         1 yield
+      1 ldaddal                      1 ldar
+      1 ldadd                        1 dmb   ishld
+```
+
+Against the x86-64 build of the same source: `mfence` 0, `lfence` 0, `sfence` 0.
+
+### The v1.0 / v1.1 ordering difference, on real hardware
+
+The comparison from §9.5 observation 10, re-run natively on Neoverse N2 rather
+than cross-compiled:
+
+| Build | `ldar` | `ldapr` |
+|---|---|---|
+| v1.1, seq_cst re-check (shipped) | **1** | 3 |
+| v1.0, acquire re-check | **0** | 4 |
+
+Identical to the cross-compiled prediction at `-march=armv8.3-a`. On a machine
+that reports `lrcpc` and `ilrcpc`, and compiling for that machine, the v1.0
+spelling of the re-check emits `ldapr` — the RCpc load — and the v1.1 spelling
+emits `ldar`.
+
 ### E0 — attach validation (evidence for the §6.2 hard exits)
 
 All three hard exits were exercised:
@@ -404,6 +491,7 @@ This section is not empty.
 | D6 | **The producer handles SIGINT/SIGTERM.** §6.1 mandates this for the consumer; §5 does not mention it for the producer. | §5.6 requires a summary line "on exit", and `--frames 0` (required by T3, T4 and T5) has no other exit path. Without a handler the mandated summary would be unreachable in the mode the tests use. |
 | D7 | **Sanitizer builds use suffixed binary names** (`fpb_producer_tsan` etc.) rather than overwriting `fpb_producer`. | Keeps the §2.2 artifacts intact while T6/T7 run. Same source, same flags otherwise. |
 | D8 | **`FPB_MAP_BYTES` macro added** to the ABI block. | §3.5 requires asserting the total mapping size and the value is needed at three sites (`ftruncate`, the `fstat` check, the assertion). It names a spec-mandated quantity rather than introducing a new one. |
+| D9 | **A CI workflow exists** (`.github/workflows/aarch64.yml`), and the deliverables were published to a public GitHub repository. | Direct user instruction. Same standing as D1: §1/§10 exclude build tooling, and the user overrode that. The workflow runs the §7 tests unmodified on real aarch64 and adds no capability to the deliverables themselves. It is what produced the second environment in §9.1. |
 
 ### Gaps — underspecified, therefore not invented
 
@@ -536,15 +624,68 @@ loads.
 that the v1.1 change is not cosmetic: it selects a different instruction on
 targets implementing `FEAT_LRCPC`. It does **not** establish that any reordering
 occurs on any device, that the v1.0 form would fail in practice, or anything else
-about aarch64 execution. §8's limit is unaltered — that question is settled by
-running on hardware that genuinely reorders, which was not done.
+about aarch64 execution.
 
 It is also a second instance of the §8 pattern: at `armv8-a` the two spellings
 are *also* indistinguishable, so even a cross-compile to the baseline target
 would have hidden the difference. It is visible only at `armv8.3-a` and above.
 
+This result was subsequently reproduced natively on Neoverse N2 hardware — see
+§9.3 — with identical counts.
+
+**11. The aarch64 run does not lift §8's central limit.** T1–T9 were executed on
+a Neoverse N2 that reports `lrcpc` and `ilrcpc`, and eight of nine passed. It is
+tempting to read that as the memory ordering having been validated. It has not
+been. A seqlock ordering bug is *probabilistic*: it requires a specific
+interleaving to coincide with a specific reordering, and a five-second run at
+60 fps samples a vanishingly small part of that space. Passing here is consistent
+with correct barriers and also consistent with incorrect barriers that did not
+happen to fire. The v1.0 variant was compiled on that hardware but never run
+under stress, so nothing is known about whether it would fail in practice.
+
+What the aarch64 run *does* establish is narrower and still worth having: the
+code builds and runs correctly on a weakly-ordered machine, the protocol's
+counting invariants hold there, and the §4.6 instruction-selection difference is
+real on shipping silicon rather than only in a cross-compiler. Establishing that
+the ordering is *correct* would need a stress harness and a deliberate attempt to
+provoke the reordering, which is out of scope here.
+
+**12. Latency on the N2 runner was an order of magnitude better, which is the
+point of §8's second limit.** Wake latency p50 was **9 µs** on Neoverse N2 against
+**87 µs** on WSL2, with p99 22 µs against 252 µs. Staleness mean 10 µs against
+111 µs. Nothing about the protocol changed; the difference is WSL2 being a VM
+versus a runner closer to bare metal. Both numbers are equally unusable as
+predictions for a phone under render load, which is what §8 says.
+
+**13. The retry path is measurably more active on aarch64.** At 120 fps under
+TSan, x86-64 produced `odd_hits 8, torn 1, eagain 1`; the N2 run at the same
+settings produced `odd_hits 2, torn 15`. In poll mode at 60 fps, x86-64 produced
+all zeros in T3 while N2 produced `odd_hits 8, eagain 1` — the T3 criterion
+failure described in §9.3. The path that §8 warned might be untested is being
+exercised considerably harder on the second platform. Whether the difference is
+architectural or an artefact of a shared CI runner is not separable from this
+data.
+
+**14. `futex_waits == writer_syscalls` held exactly on aarch64 too.** 901 and 901
+at 60 fps, 1801 and 1801 at 120 fps under TSan — the same exact equality observed
+on x86-64 at three frame rates, now on a fourth and fifth data point on different
+silicon. The ±2% band has yet to be approached on any platform tested.
+
 ---
 
-*No claim is made in this report about aarch64, on-device behaviour, or the
-driver mapping. The Android cross-compile targets in the `Makefile` were never
-executed; §8's limits stand unaltered.*
+---
+
+*On the §8 boundary, stated precisely because it moved during this work.*
+
+*T1–T9 were executed on real aarch64 hardware (Neoverse N2, §9.1), so this report
+does contain aarch64 **measurements**. It contains no claim that memory-ordering
+correctness has been **established** — see §9.5 observation 11 for why eight
+passing tests on weakly-ordered silicon do not amount to that. §8's first and
+second limits stand: ordering correctness is not demonstrated, and no latency
+figure from either environment transfers to a device under render load.*
+
+*The remaining §8 limits are untouched. Futex viability over a `VM_PFNMAP` driver
+mapping was not tested and is not testable here. ThreadSanitizer's cross-process
+blindness is unchanged. No claim is made about on-device behaviour: the
+`Makefile`'s Android/NDK targets were never executed, no phone was involved, and
+the aarch64 results come from a Linux CI runner, not from Android or bionic.*
